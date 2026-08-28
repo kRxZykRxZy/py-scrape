@@ -1,0 +1,12 @@
+services:
+  py-scrape:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "81:81"
+    env_file:
+      - .env
+    environment:
+      DB_PATH: /app/data/py_scrape.db
+    volumes:
+      - ./data:/app/data
