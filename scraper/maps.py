@@ -1,4 +1,4 @@
-"""Lightweight Google Places Text Search (New) client for ARMv7 Pi systems."""
+"""Lightweight Google Places Text Search client for ARMv7 Pi systems."""
 import json, os, re, time, urllib.error, urllib.request
 API_URL="https://places.googleapis.com/v1/places:searchText"; POSTCODES_URL="https://api.postcodes.io/outcodes/{}"; API_KEY=os.getenv("GOOGLE_MAPS_API_KEY","").strip(); TIMEOUT=float(os.getenv("MAPS_TIMEOUT","15")); PAGE_SIZE=20
 POSTCODE_RE=re.compile(r"^[A-Z]{1,2}\d[A-Z\d]?$")
@@ -31,7 +31,9 @@ def _search(query,bounds,token=None):
  return _request(API_URL,body,headers,"POST")
 def _normalise(place,outcode,borough,category):
  d=place.get("displayName") or {}; types=place.get("types") or []
- return {"place_id":place.get("id",""),"name":d.get("text","").strip(),"category":types[0].replace("_"," ").title() if types else category.title(),"phone":place.get("nationalPhoneNumber","").strip(),"email":"","address":place.get("formattedAddress","").strip(),"website":"","maps_url":"","business_status":place.get("businessStatus",""),"postcode_district":outcode,"borough":borough}
+ place_id=place.get("id","")
+ if isinstance(place_id,(list,dict)): place_id=json.dumps(place_id,sort_keys=True)
+ return {"place_id":str(place_id),"name":str(d.get("text","")).strip(),"category":types[0].replace("_"," ").title() if types else category.title(),"phone":str(place.get("nationalPhoneNumber","")).strip(),"email":"","address":str(place.get("formattedAddress","")).strip(),"website":"","maps_url":"","business_status":place.get("businessStatus",""),"postcode_district":outcode,"borough":borough}
 def search_google_maps(postcode,amount):
  if not API_KEY: raise RuntimeError("GOOGLE_MAPS_API_KEY is not configured")
  outcode=validate_postcode(postcode); bounds,borough=_area(outcode); target=max(1,min(int(amount),1000)); results=[]; seen=set()
@@ -43,6 +45,7 @@ def search_google_maps(postcode,amount):
    for place in payload.get("places",[]):
     if place.get("websiteUri"): continue
     row=_normalise(place,outcode,borough,category); key=row["place_id"] or row["name"].lower()
+    key=str(key)
     if not key or key in seen: continue
     seen.add(key); results.append(row)
     if len(results)>=target: break
