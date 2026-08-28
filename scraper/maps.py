@@ -12,32 +12,35 @@ def _request(url,body=None,headers=None,method='GET'):
   with urllib.request.urlopen(req,timeout=TIMEOUT) as r:return json.loads(r.read().decode())
  except urllib.error.HTTPError as e:raise RuntimeError('HTTP %s: %s'%(e.code,e.read().decode('utf-8','replace')[:1000])) from e
  except urllib.error.URLError as e:raise RuntimeError('Network request failed: %s'%e.reason) from e
+def _text(v):
+ if isinstance(v,(list,tuple)):return ' '.join(_text(x) for x in v)
+ if isinstance(v,dict):return ' '.join(_text(x) for x in v.values())
+ return '' if v is None else str(v)
 def _area(outcode):
- result=_request(POSTCODES_URL.format(outcode)).get('result')
- if not result:raise ValueError('Postcode district was not found')
- # postcodes.io may expose admin_district as a list in some responses.
- district=result.get('admin_district','')
- if isinstance(district,(list,tuple)):district=' '.join(map(str,district))
- district=str(district)
- prefix=re.match(r'[A-Z]+',outcode)
- if not prefix or prefix.group(0) not in LONDON_PREFIXES or district not in LONDON_BOROUGHS:raise ValueError('Only London postcode districts are supported')
- b=result.get('bounds') or {}
- if not all(k in b for k in ('north','south','east','west')):
-  lat,lon=result['latitude'],result['longitude'];b={'north':lat+.01,'south':lat-.01,'east':lon+.015,'west':lon-.015}
+ data=_request(POSTCODES_URL.format(outcode)); result=data.get('result') if isinstance(data,dict) else None
+ if not isinstance(result,dict):raise ValueError('Postcode district was not found')
+ district=_text(result.get('admin_district','')).strip()
+ prefix_match=re.match(r'[A-Z]+',str(outcode)); prefix=prefix_match.group(0) if prefix_match else ''
+ if prefix not in LONDON_PREFIXES or district not in LONDON_BOROUGHS:raise ValueError('Only London postcode districts are supported')
+ b=result.get('bounds')
+ if not isinstance(b,dict) or not all(k in b for k in ('north','south','east','west')):
+  lat=float(result['latitude']);lon=float(result['longitude']);b={'north':lat+.01,'south':lat-.01,'east':lon+.015,'west':lon-.015}
  return b,district
 def validate_postcode(postcode):
- value=re.sub(r'\s+','',postcode or '').upper()
+ value=re.sub(r'\s+','',_text(postcode)).upper()
  if not POSTCODE_RE.fullmatch(value):raise ValueError('Enter a London postcode district such as UB10 or NW10')
  return value
 def _search(query,bounds,token=None):
  body={'textQuery':query,'pageSize':PAGE_SIZE,'regionCode':'GB','locationRestriction':{'rectangle':{'low':{'latitude':bounds['south'],'longitude':bounds['west']},'high':{'latitude':bounds['north'],'longitude':bounds['east']}}}}
- if token:body['pageToken']=token
+ if token:body['pageToken']=str(token)
  headers={'Content-Type':'application/json','X-Goog-Api-Key':API_KEY,'X-Goog-FieldMask':'places.id,places.displayName,places.formattedAddress,places.nationalPhoneNumber,places.websiteUri,places.types,places.businessStatus,nextPageToken','User-Agent':'py-scrape/1.0'}
  return _request(API_URL,body,headers,'POST')
 def _normalise(place,outcode,borough,category):
- d=place.get('displayName') or {};types=place.get('types') or [];place_id=place.get('id','')
- if isinstance(place_id,(list,dict)):place_id=json.dumps(place_id,sort_keys=True)
- return {'place_id':str(place_id),'name':str(d.get('text','')).strip(),'category':types[0].replace('_',' ').title() if types else category.title(),'phone':str(place.get('nationalPhoneNumber','')).strip(),'email':'','address':str(place.get('formattedAddress','')).strip(),'website':'','maps_url':'','business_status':str(place.get('businessStatus','')),'postcode_district':outcode,'borough':borough}
+ place=place if isinstance(place,dict) else {}; d=place.get('displayName');d=d if isinstance(d,dict) else {}
+ types=place.get('types');types=types if isinstance(types,list) else []
+ types=[_text(x) for x in types];place_id=_text(place.get('id',''))
+ name=_text(d.get('text','')).strip(); cat=(types[0].replace('_',' ').title() if types and types[0] else category.title())
+ return {'place_id':place_id,'name':name,'category':cat,'phone':_text(place.get('nationalPhoneNumber','')).strip(),'email':'','address':_text(place.get('formattedAddress','')).strip(),'website':'','maps_url':'','business_status':_text(place.get('businessStatus','')),'postcode_district':outcode,'borough':borough}
 def search_google_maps(postcode,amount,on_result=None):
  if not API_KEY:raise RuntimeError('GOOGLE_MAPS_API_KEY is not configured')
  outcode=validate_postcode(postcode);bounds,borough=_area(outcode);target=max(1,min(int(amount),1000));results=[];seen=set()
@@ -45,10 +48,14 @@ def search_google_maps(postcode,amount,on_result=None):
   if len(results)>=target:break
   token=None
   for _ in range(3):
-   payload=_search('%s in %s, London, UK'%(category,outcode),bounds,token)
-   for place in payload.get('places',[]):
-    if place.get('websiteUri'):continue
-    row=_normalise(place,outcode,borough,category);key=str(row['place_id'] or row['name'].lower())
+   payload=_search('%s in %s, London, UK'%(category,outcode),bounds,token); places=payload.get('places',[]) if isinstance(payload,dict) else []
+   if not isinstance(places,list):places=[]
+   for place in places:
+    if not isinstance(place,dict):continue
+    website=place.get('websiteUri');
+    if website:continue
+    row=_normalise(place,outcode,borough,category);key=row['place_id'] or row['name'].lower()
+    key=_text(key).strip().lower()
     if not key or key in seen:continue
     seen.add(key);results.append(row)
     if on_result:
@@ -56,7 +63,7 @@ def search_google_maps(postcode,amount,on_result=None):
      except Exception:pass
     if len(results)>=target:break
    if len(results)>=target:break
-   token=payload.get('nextPageToken')
+   token=payload.get('nextPageToken') if isinstance(payload,dict) else None
    if not token:break
    time.sleep(1.2)
  return results[:target]
