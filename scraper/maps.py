@@ -1,27 +1,95 @@
-import json, os, re, urllib.parse, urllib.request
-from config import REQUEST_TIMEOUT
+"""Lightweight Google Places Text Search (New) client for ARMv7 Pi systems."""
+import json
+import os
+import re
+import time
+import urllib.error
+import urllib.request
 
-BASE='https://maps.googleapis.com/maps/api/place'
+API_URL = "https://places.googleapis.com/v1/places:searchText"
+API_KEY = os.getenv("GOOGLE_MAPS_API_KEY", "").strip()
+TIMEOUT = float(os.getenv("MAPS_TIMEOUT", "15"))
+PAGE_SIZE = 20
+POSTCODE_RE = re.compile(r"^[A-Z]{1,2}\d[A-Z\d]?$")
 
-def _get(path, params):
-    params=dict(params);params['key']=os.getenv('GOOGLE_MAPS_API_KEY','')
-    if not params['key']: raise RuntimeError('GOOGLE_MAPS_API_KEY is not configured')
-    url=BASE+path+'?'+urllib.parse.urlencode(params)
-    req=urllib.request.Request(url,headers={'User-Agent':'py-scrape/1.0'})
-    with urllib.request.urlopen(req,timeout=REQUEST_TIMEOUT) as r:return json.loads(r.read().decode())
+
+def validate_postcode(postcode):
+    value = re.sub(r"\s+", "", postcode or "").upper()
+    if not POSTCODE_RE.fullmatch(value):
+        raise ValueError("Enter a London postcode district such as UB10 or NW10")
+    return value
+
+
+def _request(body):
+    if not API_KEY:
+        raise RuntimeError("GOOGLE_MAPS_API_KEY is not configured")
+    request = urllib.request.Request(
+        API_URL,
+        data=json.dumps(body).encode("utf-8"),
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "X-Goog-Api-Key": API_KEY,
+            "X-Goog-FieldMask": "places.id,places.displayName,places.formattedAddress,places.nationalPhoneNumber,places.websiteUri,places.types,places.businessStatus,nextPageToken",
+            "User-Agent": "py-scrape/1.0",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", "replace")[:1000]
+        raise RuntimeError("Google Places API HTTP %s: %s" % (exc.code, detail)) from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError("Google Places API connection failed: %s" % exc.reason) from exc
+
+
+def _normalise(place):
+    display = place.get("displayName") or {}
+    types = place.get("types") or []
+    return {
+        "place_id": place.get("id", ""),
+        "name": display.get("text", "").strip(),
+        "category": types[0].replace("_", " ").title() if types else "",
+        "phone": place.get("nationalPhoneNumber", "").strip(),
+        "email": "",
+        "address": place.get("formattedAddress", "").strip(),
+        "website": place.get("websiteUri", "").strip(),
+        "business_status": place.get("businessStatus", ""),
+    }
+
 
 def search_google_maps(postcode, amount):
-    # Places Text Search is used instead of browser automation, keeping the Pi 2 workload small.
-    query=f'businesses in {postcode}, London, UK'
-    first=_get('/textsearch/json',{'query':query})
-    results=list(first.get('results',[]))
-    token=first.get('next_page_token')
-    while len(results)<amount and token:
-        import time;time.sleep(2)
-        page=_get('/textsearch/json',{'pagetoken':token});results.extend(page.get('results',[]));token=page.get('next_page_token')
-    out=[]
-    for p in results[:amount]:
-        d=_get('/details/json',{'place_id':p.get('place_id'),'fields':'name,formatted_address,formatted_phone_number,website,types,url'})
-        x=d.get('result',{})
-        out.append({'name':x.get('name',p.get('name','')),'category':(x.get('types') or [''])[0],'phone':x.get('formatted_phone_number',''),'email':'','address':x.get('formatted_address',p.get('formatted_address','')),'website':x.get('website',''),'maps_url':x.get('url','')})
-    return out
+    postcode = validate_postcode(postcode)
+    amount = max(1, min(int(amount), 1000))
+    queries = [
+        "businesses in %s, London, UK" % postcode,
+        "shops in %s, London, UK" % postcode,
+        "services in %s, London, UK" % postcode,
+        "companies in %s, London, UK" % postcode,
+    ]
+    results, seen = [], set()
+    for query in queries:
+        token = None
+        while len(results) < amount:
+            body = {"textQuery": query, "pageSize": PAGE_SIZE, "regionCode": "GB"}
+            if token:
+                body["pageToken"] = token
+                time.sleep(1.5)
+            response = _request(body)
+            places = response.get("places", [])
+            for raw in places:
+                row = _normalise(raw)
+                key = row["place_id"] or row["name"].lower()
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                results.append(row)
+                if len(results) >= amount:
+                    break
+            token = response.get("nextPageToken")
+            if not token or not places:
+                break
+        if len(results) >= amount:
+            break
+    return results[:amount]
