@@ -1,10 +1,10 @@
-FROM arm32v7/python:3.11-slim-bookworm
+FROM python:3.11-slim-bookworm
 WORKDIR /app
-ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PIP_DISABLE_PIP_VERSION_CHECK=1
 COPY requirements.txt .
-RUN python -m pip install --upgrade pip && pip install -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
-RUN mkdir -p data
+RUN mkdir -p /app/data
 EXPOSE 81
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:81/health',timeout=3)"
-CMD ["python","main.py"]
+CMD ["gunicorn","--bind","0.0.0.0:81","--workers","1","--threads","2","--timeout","120","main:app"]
