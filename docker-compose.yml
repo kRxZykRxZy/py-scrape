@@ -1,0 +1,19 @@
+services:
+  scraper:
+    build: .
+    environment:
+      GOOGLE_MAPS_API_KEY: ${GOOGLE_MAPS_API_KEY:-}
+    volumes:
+      - ./output:/app/output
+    stdin_open: true
+    tty: true
+
+  # Optional AI sidecar. Keep disabled on the Pi until the base scraper works.
+  # A CPU-only SmolLM-125M image/runner can be attached here without making
+  # the scraper depend on it for normal operation.
+  smollm:
+    image: ghcr.io/ggerganov/llama.cpp:server
+    profiles: ["ai"]
+    command: ["-m", "/models/smollm-125m.gguf", "--host", "0.0.0.0", "--port", "8080", "-c", "1024", "-t", "2"]
+    volumes:
+      - ./models:/models:ro
