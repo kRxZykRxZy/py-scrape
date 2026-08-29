@@ -1,10 +1,9 @@
 """Dedicated persistent scrape worker for Pi 2/ARMv7.
 Runs up to three independent scrape jobs concurrently using Python threads.
-The Maps scraper API is intentionally unchanged; concurrency is provided here.
 """
 import time, threading
 from main import db, log, DB_LOCK, CONTROL
-from scraper.maps import search_google_maps
+from scraper.maps_uk import search_google_maps
 MAX_THREADS = 3
 
 def run_job(jid, postcode, target):
@@ -30,8 +29,6 @@ def run_job(jid, postcode, target):
                     c.execute('insert into leads(job_id,name,category,phone,email,address,website) values(?,?,?,?,?,?,?)', (jid,name,r.get('category',''),r.get('phone',''),r.get('email',''),r.get('address',''),r.get('website','')))
                     saved += 1
                 c.execute('update scrape_jobs set found=?,saved=? where id=?', (found,saved,jid)); c.commit(); c.close()
-        # IMPORTANT: maps.py does not accept a threads= parameter. The three
-        # worker threads call the stable scraper API independently.
         search_google_maps(postcode, target, on_result=on_result)
         with DB_LOCK:
             c = db(); state = c.execute('select status from scrape_jobs where id=?', (jid,)).fetchone()
