@@ -7,4 +7,5 @@ COPY . .
 RUN mkdir -p /app/data
 EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health',timeout=3)"
-CMD ["gunicorn","--bind","0.0.0.0:8000","--workers","1","--threads","2","--timeout","120","main:app"]
+# Two workers keep the UI responsive while one worker is busy with a scrape.
+CMD ["gunicorn","--bind","0.0.0.0:8000","--workers","2","--threads","2","--worker-class","gthread","--timeout","120","--access-logfile","-","--error-logfile","-","main:app"]
