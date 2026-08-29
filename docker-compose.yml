@@ -1,0 +1,11 @@
+services:
+  py-scrape:
+    build: .
+    container_name: py-scrape
+    restart: unless-stopped
+    ports:
+      - "81:81"
+    volumes:
+      - ./data:/app/data
+    environment:
+      PYTHONUNBUFFERED: "1"
