@@ -1,14 +1,14 @@
 """Public contact/website enrichment for ARMv7/Pi 2.
 
-Pipeline: UK-focused SearXNG discovery -> first-party/contact-page inspection ->
-optional Pollinations no-key website verifier. All network calls are best-effort,
-sequential and bounded so the Pi 2 stays responsive.
+Uses configured English/UK SearXNG instances sequentially, inspects public
+first-party pages, and optionally uses the free Pollinations text endpoint as
+an advisory verifier. It never invents contact details.
 """
 import re, html, json, os, urllib.parse, urllib.request
 from urllib.error import HTTPError, URLError
 
 TIMEOUT = float(os.getenv('ENRICH_TIMEOUT', '8'))
-UA = 'py-scrape/1.5 (+public-contact-research)'
+UA = 'py-scrape/1.6 (+public-contact-research)'
 EMAIL_RE = re.compile(r"(?i)(?:mailto:)?([a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9-]+(?:\.[a-z0-9-]+)+)")
 PHONE_RE = re.compile(r"(?<!\d)(?:\+44\s?\(?0?\)?|0)(?:\s?[1-9]\d{2,4})?(?:[\s.-]?\d){6,9}(?!\d)")
 BAD_DOMAINS = {
@@ -19,14 +19,15 @@ BAD_DOMAINS = {
 }
 BAD_EMAIL_PARTS = ('example.', 'wixpress.', 'sentry.', 'wordpress.', 'cloudflare.', 'noreply@', 'no-reply@')
 
-# The supplied instance list contained one UK-hosted SearXNG URL. Keep it first,
-# and allow the operator to add other UK/English instances through the environment.
+# The supplied monitoring table did not contain an instance explicitly marked
+# Country=UK. The .uk endpoint below is retained as the default. In production,
+# set SEARXNG_URLS to a comma-separated list of verified English/UK instances.
+# They are always tested one-by-one; a timeout, error OR empty response causes
+# the next instance to be tried.
 DEFAULT_SEARXNG = ['https://search.undertale.uk/']
-SEARXNG_URLS = [
-    x.strip().rstrip('/')
-    for x in os.getenv('SEARXNG_URLS', ','.join(DEFAULT_SEARXNG)).split(',')
-    if x.strip()
-]
+SEARXNG_URLS = [x.strip().rstrip('/') for x in os.getenv(
+    'SEARXNG_URLS', ','.join(DEFAULT_SEARXNG)
+).split(',') if x.strip()]
 POLLINATIONS_URL = os.getenv('POLLINATIONS_URL', 'https://text.pollinations.ai').rstrip('/')
 
 
@@ -56,7 +57,7 @@ def _is_bad_domain(domain):
 
 
 def _searx(query):
-    """Try configured English/UK SearXNG instances sequentially."""
+    """Try every configured SearXNG instance until useful results are returned."""
     for base in SEARXNG_URLS:
         try:
             url = base + '/?q=' + urllib.parse.quote(query) + '&format=json&language=en&categories=general'
@@ -79,13 +80,19 @@ def _searx(query):
                     for result in results if isinstance(result, dict)
                     for k in ('title', 'content', 'url')
                 )
-                return text, links
+                # A live SearXNG instance returning zero results is not a useful
+                # result for this lookup, so fail over to the next instance.
+                if text.strip() or links:
+                    return text, links
+                continue
             except Exception:
                 for raw in re.findall(r'href=[\"\']([^\"\']+)[\"\']', body, re.I):
                     raw = html.unescape(raw)
                     if raw.startswith(('http://', 'https://')):
                         links.append(raw)
-                return body, links
+                if links:
+                    return body, links
+                continue
         except (HTTPError, URLError, TimeoutError, OSError, ValueError):
             continue
     return '', []
@@ -131,19 +138,15 @@ def _looks_first_party(name, domain, visible=''):
     compact_domain = re.sub(r'[^a-z0-9]', '', domain)
     compact_name = re.sub(r'[^a-z0-9]', '', name.lower())
     domain_words = set(re.findall(r'[a-z0-9]+', domain))
-
-    # Handles branding such as "Accounts Aid" -> accountsaid.co.uk.
     if compact_name and compact_name in compact_domain:
         return True
     if tokens and any(token in domain_words or token in compact_domain for token in tokens):
         return True
-
     visible_lower = visible.lower()
     return bool(tokens and sum(1 for token in tokens if token in visible_lower) >= max(1, min(2, len(tokens))))
 
 
 def _contact_paths(base_url):
-    """Return likely contact/about pages for a candidate first-party site."""
     parsed = urllib.parse.urlsplit(base_url)
     if not parsed.scheme or not parsed.netloc:
         return []
@@ -152,19 +155,31 @@ def _contact_paths(base_url):
         '/contact-us/', '/contact/', '/contact', '/about-us/', '/about/', '/about',
         '/get-in-touch/', '/find-us/'
     ]
-    # Preserve the discovered URL first, then cheap common contact locations.
     return list(dict.fromkeys([base_url] + [root + path for path in paths]))
 
 
-def _pollinations_verify(name, address, links):
-    """Use free text.pollinations.ai as a best-effort website verifier.
-
-    No API key is sent. The model is advisory only; deterministic domain checks
-    remain authoritative when the model is unavailable or malformed.
-    """
-    if not links:
+def _pollinations_json(prompt):
+    """Call free text.pollinations.ai with no API key and parse a JSON object."""
+    try:
+        url = POLLINATIONS_URL + '/' + urllib.parse.quote(prompt, safe='')
+        text, _, _ = _fetch(url, 30000, {
+            'User-Agent': UA,
+            'Accept': 'text/plain,text/html,application/json'
+        })
+        # Prefer the first JSON object in the model response; never use free-form
+        # model text as contact data.
+        match = re.search(r'\{.*?\}', text, re.S)
+        if not match:
+            return None
+        return json.loads(match.group(0).replace('```json', '').replace('```', '').strip())
+    except (HTTPError, URLError, TimeoutError, OSError, ValueError, json.JSONDecodeError):
         return None
-    compact = '\n'.join(links[:12])
+
+
+def _pollinations_verify(name, address, candidates):
+    if not candidates:
+        return None
+    compact = '\n'.join(candidates[:15])
     prompt = (
         'Verify the official website for this UK business. '
         f'Business name: {name}. Address: {address}. Candidate URLs:\n{compact}\n'
@@ -172,30 +187,48 @@ def _pollinations_verify(name, address, links):
         'Pick the official business website only. Reject Google Maps, social media, '
         'directories, review sites and unrelated businesses. If uncertain return null.'
     )
-    try:
-        url = POLLINATIONS_URL + '/' + urllib.parse.quote(prompt, safe='')
-        text, _, _ = _fetch(url, 20000, {
-            'User-Agent': UA,
-            'Accept': 'text/plain,text/html,application/json'
-        })
-        match = re.search(
-            r'\{\s*[\"\']website[\"\']\s*:\s*(null|[\"\'][^\"\']+[\"\'])\s*,\s*'
-            r'[\"\']confidence[\"\']\s*:\s*(\d+)',
-            text, re.I | re.S
-        )
-        if not match:
-            return None
-        raw = match.group(1)
-        site = None if raw.lower() == 'null' else raw.strip('\\\"\'')
-        confidence = int(match.group(2))
-        if not site or confidence < 70 or not site.startswith(('http://', 'https://')):
-            return None
-        domain = _domain(site)
-        if _is_bad_domain(domain):
-            return None
-        return site
-    except (HTTPError, URLError, TimeoutError, OSError, ValueError):
+    data = _pollinations_json(prompt)
+    if not isinstance(data, dict):
         return None
+    site = data.get('website')
+    try:
+        confidence = int(data.get('confidence', 0))
+    except Exception:
+        return None
+    if not isinstance(site, str) or confidence < 70 or not site.startswith(('http://', 'https://')):
+        return None
+    if _is_bad_domain(_domain(site)):
+        return None
+    return site
+
+
+def _pollinations_email(name, address, evidence):
+    """Select an email from supplied public evidence; the model may not invent one."""
+    if not evidence:
+        return None
+    prompt = (
+        'Find a public contact email for this UK business using ONLY the evidence below. '
+        f'Business name: {name}. Address: {address}. Evidence:\n{evidence[:30000]}\n'
+        'Return ONLY JSON: {"email":"name@example.co.uk or null","confidence":0}. '
+        'Never invent an email. Return null if no email is explicitly present in the evidence.'
+    )
+    data = _pollinations_json(prompt)
+    if not isinstance(data, dict):
+        return None
+    email = str(data.get('email') or '').lower().strip()
+    try:
+        confidence = int(data.get('confidence', 0))
+    except Exception:
+        return None
+    if confidence < 70 or not EMAIL_RE.fullmatch(email):
+        return None
+    if any(x in email for x in BAD_EMAIL_PARTS) or _is_bad_domain(email.rsplit('@', 1)[1]):
+        return None
+    # Critical anti-hallucination check: the selected address must literally
+    # occur in the public evidence supplied to the model.
+    if email not in evidence.lower():
+        return None
+    return email
 
 
 def enrich(row):
@@ -205,15 +238,22 @@ def enrich(row):
     if not name:
         return row
 
+    # The final query is deliberately broad enough to catch sites whose contact
+    # page is indexed but whose home page is not. This fixes cases such as
+    # Accounts Aid -> accountsaid.co.uk/contact-us/.
     queries = [
-        f'"{name}" "{outcode}" UK website email',
+        f'"{name}" "{outcode}" UK official website contact email',
         f'"{name}" "{address}" UK contact email',
-        f'"{name}" {outcode} UK email',
-        f'"{name}" {outcode} UK "@"',
+        f'"{name}" {outcode} UK website',
+        f'"{name}" {outcode} UK email "@"',
+        f'"{name}" UK "contact-us" email',
     ]
     links = []
+    evidence = []
     for query in queries:
         body, found_links = _searx(query)
+        if body:
+            evidence.append(body)
         links.extend(found_links)
         if not row.get('email'):
             emails = _emails(body)
@@ -226,7 +266,6 @@ def enrich(row):
         if row.get('email') and row.get('phone'):
             break
 
-    # De-duplicate by domain while retaining the first/best candidate.
     seen = set()
     candidates = []
     for link in links:
@@ -236,9 +275,8 @@ def enrich(row):
         seen.add(domain)
         candidates.append(link)
 
-    # Inspect the discovered business site AND its common contact pages.
-    # This catches sites such as accountsaid.co.uk/contact-us/ even when the
-    # SearXNG result points at another page on the same domain.
+    # Inspect the candidate and common contact pages. This is intentionally
+    # sequential and bounded for ARMv7/Pi 2.
     page_urls = []
     for candidate in candidates[:12]:
         page_urls.extend(_contact_paths(candidate))
@@ -248,7 +286,8 @@ def enrich(row):
             body, final, _ = _fetch(link)
         except (HTTPError, URLError, TimeoutError, OSError):
             continue
-
+        if body:
+            evidence.append(body)
         if not row.get('email'):
             emails = _emails(body)
             if emails:
@@ -257,24 +296,23 @@ def enrich(row):
             phones = _phones(body)
             if phones:
                 row['phone'] = phones[0]
-
         domain = _domain(final)
-        visible = re.sub(
-            r'\s+', ' ', re.sub(r'<[^>]+>', ' ', html.unescape(body))
-        ).lower()
+        visible = re.sub(r'\s+', ' ', re.sub(r'<[^>]+>', ' ', html.unescape(body))).lower()
         if not row.get('website') and _looks_first_party(name, domain, visible):
-            # Save the site's root, not a random contact-page URL.
             parsed = urllib.parse.urlsplit(final)
             row['website'] = f'{parsed.scheme}://{parsed.netloc}/'
-
         if row.get('email') and row.get('website'):
             break
 
-    # Let Pollinations adjudicate remaining candidate websites. It is never
-    # required for contact extraction, so a slow/down endpoint cannot stop a job.
     if candidates and not row.get('website'):
         verified = _pollinations_verify(name, address, candidates)
         if verified:
             row['website'] = verified
 
+    # Use Pollinations only to choose among emails already found in the public
+    # evidence. This makes the AI useful without allowing hallucinated contacts.
+    if not row.get('email') and evidence:
+        verified_email = _pollinations_email(name, address, '\n'.join(evidence))
+        if verified_email:
+            row['email'] = verified_email
     return row
