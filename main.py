@@ -11,47 +11,9 @@ def db():
  c.execute('''create table if not exists scrape_jobs(id text primary key,postcode text not null,target integer not null,found integer default 0,saved integer default 0,status text not null default 'queued',started_at real,finished_at real,error text default '',logs text default '')''');c.commit();return c
 def log(c,jid,msg):
  r=c.execute('select logs from scrape_jobs where id=?',(jid,)).fetchone();old=r['logs'] if r else '';lines=(old+'\n'+time.strftime('%H:%M:%S ') + msg).strip().splitlines()[-300:];c.execute('update scrape_jobs set logs=? where id=?',('\n'.join(lines),jid));c.commit()
-def set_status(jid,status):
- with DB_LOCK:c=db();c.execute('update scrape_jobs set status=? where id=?',(status,jid));c.commit();CONTROL.notify_all();c.close()
-def save_row(c,r,jid,seen):
- name=str(r.get('name') or '').strip();key=str(r.get('place_id') or name).strip().lower()
- if not name or key in seen or r.get('website'):return False
- seen.add(key);c.execute('insert into leads(job_id,name,category,phone,email,address,website) values(?,?,?,?,?,?,?)',(jid,name,r.get('category',''),r.get('phone',''),r.get('email',''),r.get('address',''),r.get('website','')));return True
-def scrape_job(jid,p,a):
- try:
-  with DB_LOCK:c=db();c.execute('update scrape_jobs set status="running",started_at=? where id=?',(time.time(),jid));log(c,jid,f'Started {p}, target {a}');c.close()
-  from scraper.maps import search_google_maps
-  seen=set();found=saved=0
-  def on_result(r):
-   nonlocal found,saved
-   with DB_LOCK:
-    c=db();state=c.execute('select status from scrape_jobs where id=?',(jid,)).fetchone()
-    if not state or state['status']=='deleted':c.close();raise StopIteration
-    while state['status']=='paused':
-     CONTROL.wait(timeout=2);state=c.execute('select status from scrape_jobs where id=?',(jid,)).fetchone()
-     if not state or state['status']=='deleted':c.close();raise StopIteration
-    found+=1
-    if save_row(c,r,jid,seen):saved+=1
-    c.execute('update scrape_jobs set found=?,saved=? where id=?',(found,saved,jid));c.commit();c.close()
-  search_google_maps(p,a,on_result=on_result)
-  with DB_LOCK:c=db();r=c.execute('select status from scrape_jobs where id=?',(jid,)).fetchone();
-  if r and r['status']!='deleted':
-   c.execute('update scrape_jobs set status="complete",found=?,saved=?,finished_at=? where id=?',(found,saved,time.time(),jid));log(c,jid,f'Finished: {saved} leads saved');c.close()
-  elif c:c.close()
- except StopIteration:
-  pass
- except Exception as e:
-  with DB_LOCK:c=db();r=c.execute('select status from scrape_jobs where id=?',(jid,)).fetchone();
-  if r and r['status']!='deleted':c.execute('update scrape_jobs set status="error",error=?,finished_at=? where id=?',(str(e),time.time(),jid));log(c,jid,'ERROR: '+str(e));c.close()
-with DB_LOCK:db().close()
-# Recover unfinished jobs after process/container reboot. Existing leads remain; jobs restart from their postcode.
-def recover_jobs():
- with DB_LOCK:
-  c=db();rows=c.execute('select id,postcode,target,status from scrape_jobs where status in ("running","paused","queued")').fetchall();
-  for r in rows:c.execute('update scrape_jobs set status="queued",error="Resuming after restart" where id=?',(r['id'],))
-  c.commit();c.close()
- for r in rows:threading.Thread(target=scrape_job,args=(r['id'],r['postcode'],r['target']),daemon=True).start()
-threading.Thread(target=recover_jobs,daemon=True).start()
+def _init_db():
+ c=db();c.close()
+_init_db()
 @app.get('/')
 def index():return send_from_directory('web','index.html')
 @app.get('/health')
@@ -60,7 +22,8 @@ def health():
  except Exception as e:return jsonify(ok=False,error=str(e)),503
 @app.get('/api/status')
 def status():
- with DB_LOCK:c=db();total=c.execute('select count(*) from leads').fetchone()[0];jobs=[dict(x) for x in c.execute('select * from scrape_jobs order by coalesce(started_at,0) desc')];c.close()
+ with DB_LOCK:
+  c=db();total=c.execute('select count(*) from leads').fetchone()[0];jobs=[dict(x) for x in c.execute('select * from scrape_jobs order by coalesce(started_at,0) desc')];c.close()
  return jsonify(total=total,jobs=jobs,running=any(x['status'] in ('queued','running','paused') for x in jobs))
 @app.get('/api/leads')
 def leads():
@@ -81,42 +44,51 @@ def start():
  with DB_LOCK:
   c=db();active=c.execute('select count(*) from scrape_jobs where status in ("queued","running","paused")').fetchone()[0]
   if active>=3:c.close();return jsonify(error='Maximum 3 active sessions'),409
-  jid=uuid.uuid4().hex[:12];c.execute('insert into scrape_jobs(id,postcode,target,status) values(?,?,?,"queued")',(jid,p,a));c.commit();c.close()
- threading.Thread(target=scrape_job,args=(jid,p,a),daemon=True).start();return jsonify(ok=True,job_id=jid)
+  jid=uuid.uuid4().hex[:12];c.execute('insert into scrape_jobs(id,postcode,target,status) values(?,?,?,"queued")',(jid,p,a));log(c,jid,f'Queued {p}, target {a}');c.close()
+ return jsonify(ok=True,job_id=jid)
 @app.post('/api/jobs/<jid>/pause')
 def pause(jid):
- with DB_LOCK:c=db();r=c.execute('select status from scrape_jobs where id=?',(jid,)).fetchone();
- if not r:return jsonify(error='Session not found'),404
- if r['status'] not in ('running','queued'):c.close();return jsonify(error='Session cannot be paused'),409
- c.execute('update scrape_jobs set status="paused" where id=?',(jid,));log(c,jid,'Paused');c.close();CONTROL.notify_all();return jsonify(ok=True)
+ with DB_LOCK:
+  c=db();r=c.execute('select status from scrape_jobs where id=?',(jid,)).fetchone()
+  if not r:c.close();return jsonify(error='Session not found'),404
+  if r['status'] not in ('running','queued'):c.close();return jsonify(error='Session cannot be paused'),409
+  c.execute('update scrape_jobs set status="paused" where id=?',(jid,));log(c,jid,'Paused');c.close();CONTROL.notify_all()
+ return jsonify(ok=True)
 @app.post('/api/jobs/<jid>/resume')
 def resume(jid):
- with DB_LOCK:c=db();r=c.execute('select * from scrape_jobs where id=?',(jid,)).fetchone();
- if not r:return jsonify(error='Session not found'),404
- if r['status']!='paused':c.close();return jsonify(error='Session is not paused'),409
- c.execute('update scrape_jobs set status="running" where id=?',(jid,));log(c,jid,'Resumed');c.close();CONTROL.notify_all();return jsonify(ok=True)
+ with DB_LOCK:
+  c=db();r=c.execute('select * from scrape_jobs where id=?',(jid,)).fetchone()
+  if not r:c.close();return jsonify(error='Session not found'),404
+  if r['status']!='paused':c.close();return jsonify(error='Session is not paused'),409
+  c.execute('update scrape_jobs set status="queued" where id=?',(jid,));log(c,jid,'Queued for resume');c.close();CONTROL.notify_all()
+ return jsonify(ok=True)
 @app.delete('/api/jobs/<jid>')
 def delete_job(jid):
- with DB_LOCK:c=db();r=c.execute('select id from scrape_jobs where id=?',(jid,)).fetchone();
- if not r:return jsonify(error='Session not found'),404
- c.execute('delete from leads where job_id=?',(jid,));c.execute('delete from scrape_jobs where id=?',(jid,));c.commit();c.close();CONTROL.notify_all();return jsonify(ok=True)
+ with DB_LOCK:
+  c=db();r=c.execute('select id,status from scrape_jobs where id=?',(jid,)).fetchone()
+  if not r:c.close();return jsonify(error='Session not found'),404
+  c.execute('delete from leads where job_id=?',(jid,));c.execute('delete from scrape_jobs where id=?',(jid,));c.commit();c.close();CONTROL.notify_all()
+ return jsonify(ok=True)
 @app.get('/api/export.csv')
 def export():
  jid=request.args.get('job_id','').strip()
- with DB_LOCK:c=db();rows=c.execute('select * from leads'+(' where job_id=?' if jid else '')+' order by id desc',([jid] if jid else [])).fetchall();c.close()
+ with DB_LOCK:
+  c=db();rows=c.execute('select * from leads'+(' where job_id=?' if jid else '')+' order by id desc',([jid] if jid else [])).fetchall();c.close()
  out=io.StringIO();w=csv.writer(out);w.writerow(rows[0].keys() if rows else ['id','job_id','name','category','phone','email','address','website','status','created_at']);w.writerows([tuple(r) for r in rows]);return Response(out.getvalue(),mimetype='text/csv',headers={'Content-Disposition':'attachment; filename=leads.csv'})
 @app.post('/api/leads')
 def create():
- d=request.json or {};name=str(d.get('name','')).strip();
+ d=request.json or {};name=str(d.get('name','')).strip()
  if not name:return jsonify(error='Business name is required'),400
  s=d.get('status','new');s=s if s in ALLOWED_STATUS else 'new'
- with DB_LOCK:c=db();cur=c.execute('insert into leads(job_id,name,category,phone,email,address,website,status) values(?,?,?,?,?,?,?,?)',(d.get('job_id'),name,d.get('category',''),d.get('phone',''),d.get('email',''),d.get('address',''),d.get('website',''),s));c.commit();c.close()
+ with DB_LOCK:
+  c=db();cur=c.execute('insert into leads(job_id,name,category,phone,email,address,website,status) values(?,?,?,?,?,?,?,?)',(d.get('job_id'),name,d.get('category',''),d.get('phone',''),d.get('email',''),d.get('address',''),d.get('website',''),s));c.commit();c.close()
  return jsonify(id=cur.lastrowid)
 @app.patch('/api/leads/<int:i>')
 def patch(i):
  d=request.json or {};s=d.get('status','new')
  if s not in ALLOWED_STATUS:return jsonify(error='Invalid status'),400
- with DB_LOCK:c=db();cur=c.execute('update leads set status=?,name=coalesce(?,name),phone=coalesce(?,phone),email=coalesce(?,email),address=coalesce(?,address),category=coalesce(?,category),website=coalesce(?,website) where id=?',(s,d.get('name'),d.get('phone'),d.get('email'),d.get('address'),d.get('category'),d.get('website'),i));c.commit();c.close()
+ with DB_LOCK:
+  c=db();cur=c.execute('update leads set status=?,name=coalesce(?,name),phone=coalesce(?,phone),email=coalesce(?,email),address=coalesce(?,address),category=coalesce(?,category),website=coalesce(?,website) where id=?',(s,d.get('name'),d.get('phone'),d.get('email'),d.get('address'),d.get('category'),d.get('website'),i));c.commit();c.close()
  return jsonify(ok=cur.rowcount>0)
 @app.delete('/api/leads/<int:i>')
 def delete(i):
